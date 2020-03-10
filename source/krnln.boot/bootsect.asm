@@ -1,6 +1,9 @@
 .intel_syntax noprefix
-.equ BOOTSTART, 0x07c0
-.equ KRNLNBOOT, 0x07e0
+
+.equ OFFSET_BOOTSTART, 0x07c0
+.equ OFFSET_KRNLNBOOT, 0x07e0
+.equ BASE_BOOTSTART, OFFSET_BOOTSTART << 4
+.equ BASE_KRNLNBOOT, OFFSET_KRNLNBOOT << 4
 .extern _krnl_MMain
 
 .code16
@@ -11,12 +14,14 @@
   _entry:
   xchg bx, bx
 
+  # 將段寄存器設置爲 OFFSET_BOOTSTART
+  # 因爲代碼基地址偏移是0x0000
+  # 需要用段寄存器尋址
+  mov ax, OFFSET_BOOTSTART
+  mov ds, ax
+
   # 重置顯示器
   call _func_reset_screen
-
-  # 打印字串
-  lea ax, _msg_load
-  call _func_print_str2
 
   # 加載程序主體部分
   lea ax, _msg_ldisk
@@ -102,7 +107,7 @@
   # 將程序加載到内存
   # 返回 ax 加載是否成功
   _func_disk_read:
-    mov ax, KRNLNBOOT # 中斷參數 緩衝區
+    mov ax, OFFSET_KRNLNBOOT # 中斷參數 緩衝區
     mov es, ax
     mov ah, 0x02      # 中斷函數
     mov bx, 0x0000    # 中斷參數 緩衝區偏移
@@ -144,56 +149,43 @@
 
   # 調用上層代碼
   _func_main:
-    jmp 0x08:_func_32bit  # 超級遠跳轉
-                          # 一去不復返 2333
+    xchg bx, bx
+
+    # 超級遠跳轉 進入32位模式
+    jmp 0x08: BASE_BOOTSTART + _krnl_MMain
+
   ret
 
-.code32
-_func_32bit:
-
-  mov ax, 0x0010
-  mov ds, ax
-  mov gs, ax
-  mov es, ax
-  # mov ss, ax
-
-  xor eax, eax      # 清空寄存器
-  mov ebx, eax      # 為接下來的代碼做準備
-  mov ecx, eax
-  mov edx, eax
-  
-  push 0            # 空參數
-  call _krnl_MMain  # 跳到函數入口
-
-  jmp $             # 死循環啦
-
-ret
-
 # 保存的字串
-.org 0x150
+.org 0x100
   _msg_ok:      .asciz " OK!\r\n"
   _msg_failed:  .asciz " FAILED!\r\n"
-  _msg_load:    .asciz "== Hello World! ==\r\n"
   _msg_ldisk:   .asciz "Loading elKernel..."
   _msg_lgdt:    .asciz "Loading GDT...     "
   _msg_entrypm: .asciz "Entry into Protected Mode..."
 
 # 全局描述符表
-.org 0x1D0
+# 參考 https://wiki.osdev.org/Global_Descriptor_Table
+.org 0x1A0
   _GDT_HEADER:
-    .2byte _GDT_ENTRIES_END - _GDT_ENTRIES  # GDT Size
-    .4byte _GDT_ENTRIES                     # GDT Base
+    # GDT Size
+    .2byte _GDT_ENTRIES_END - _GDT_ENTRIES
+
+    # GDT Base 這裏是在綫性物理内存的指針
+    .4byte BASE_BOOTSTART + _GDT_ENTRIES
 
   _GDT_ENTRIES:
+    # SEG 0x00 必須爲空
     _GDT_NULL:
       .2byte 0x0000   # limit low
       .2byte 0x0000   # base low
       .byte  0x00     # base middle
       .byte  0x00     # access type
-      .byte  0x00     # limit high, flags
+      .byte  0x00     # flags, limit high
       .byte  0x00     # base high
 
-    _GDT_CODE32:
+    # SEG 0x08 4GB 專用於引導代碼
+    _GDT_BOOTSECT:
       # Base  0x00000000
       # Limit 0x000FFFFF
       # Access 1(Pr) 00(Privl) 1(S) 1(Ex) 0(DC) 1(RW) 1(Ac)
@@ -205,7 +197,21 @@ ret
       .byte  0xCF     # limit high, flags
       .byte  0x00     # base high
 
-    _GDT_DATA:
+    # SEG 0x10 32MB 專用於内核代碼
+    _GDT_KERNEL_CODE32:
+      # Base  0x00007E00
+      # Limit 0x00001FFF
+      # Access 1(Pr) 00(Privl) 1(S) 0(Ex) 0(DC) 1(RW) 1(Ac)
+      # Flag   1(Gr) 1(Sz) 0(Null) 0(Null)
+      .2byte 0x1FFF   # limit low
+      .2byte 0x7E00   # base low
+      .byte  0x00     # base middle
+      .byte  0x93     # access type
+      .byte  0xC0     # flags, limit high
+      .byte  0x00     # base high
+
+    # SEG 0x18 專用於内核數據
+    _GDT_KERNEL_DATA32:
       # Base  0x00000000
       # Limit 0x000FFFFF
       # Access 1(Pr) 00(Privl) 1(S) 0(Ex) 0(DC) 1(RW) 1(Ac)
@@ -214,10 +220,36 @@ ret
       .2byte 0x0000   # base low
       .byte  0x00     # base middle
       .byte  0x93     # access type
-      .byte  0xCF     # limit high, flags
+      .byte  0xCF     # flags, limit high
       .byte  0x00     # base high
 
-    _GDT_VIDEO:
+    # SEG 0x20 專用於内核視頻緩衝區
+    _GDT_KERNEL_VIDEO:
+      .2byte 0x0000   # limit low
+      .2byte 0x0000   # base low
+      .byte  0x00     # base middle
+      .byte  0x00     # access type
+      .byte  0x00     # flags, limit high
+      .byte  0x00     # base high
+
+    # SEG 0x28 專用於用戶代碼 暫未使用
+    _GDT_USER_CODE32:
+      .2byte 0x0000   # limit low
+      .2byte 0x0000   # base low
+      .byte  0x00     # base middle
+      .byte  0x00     # access type
+      .byte  0x00     # flags, limit high
+      .byte  0x00     # base high
+
+    # SEG 0x30 專用於用戶數據 暫未使用
+    _GDT_USER_DATA32:
+      .2byte 0x0000   # limit low
+      .2byte 0x0000   # base low
+      .byte  0x00     # base middle
+      .byte  0x00     # access type
+      .byte  0x00     # flags, limit high
+      .byte  0x00     # base high
+
   _GDT_ENTRIES_END:
 
 # 可引導扇區標識符
